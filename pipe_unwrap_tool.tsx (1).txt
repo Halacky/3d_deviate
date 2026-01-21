@@ -1,0 +1,245 @@
+import numpy as np
+import open3d as o3d
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+from scipy.interpolate import griddata
+
+def load_point_cloud(filepath):
+    """Загрузка PLY файла"""
+    pcd = o3d.io.read_point_cloud(filepath)
+    points = np.asarray(pcd.points)
+    
+    colors = None
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+    
+    print(f"Загружено точек: {len(points)}")
+    return points, colors
+
+def find_cylinder_axis(points):
+    """Находит ось цилиндра через PCA"""
+    # Используем выборку для ускорения
+    if len(points) > 20000:
+        indices = np.random.choice(len(points), 20000, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+    
+    pca = PCA(n_components=3)
+    pca.fit(sample)
+    
+    # Главная компонента = ось цилиндра
+    axis = pca.components_[0]
+    center = np.mean(sample, axis=0)
+    
+    return center, axis
+
+def align_points(points, center, axis):
+    """Выравнивает точки так, чтобы ось была вдоль Z"""
+    # Центрируем
+    points_centered = points - center
+    
+    # Нормализуем ось
+    axis = axis / np.linalg.norm(axis)
+    
+    # Целевое направление - ось Z
+    target = np.array([0, 0, 1])
+    
+    # Вектор вращения
+    v = np.cross(axis, target)
+    s = np.linalg.norm(v)
+    c = np.dot(axis, target)
+    
+    # Матрица поворота (формула Родрига)
+    if s > 1e-6:
+        vx = np.array([[0, -v[2], v[1]], 
+                       [v[2], 0, -v[0]], 
+                       [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+    else:
+        R = np.eye(3)
+    
+    aligned = points_centered @ R.T
+    
+    return aligned
+
+def unwrap_cylinder(points, width=2000, height=1000, cut_angle=0):
+    """
+    Разворачивает цилиндр на плоскость
+    
+    Параметры:
+    - points: выровненные точки (ось Z = ось цилиндра)
+    - width: ширина результата в пикселях (по окружности)
+    - height: высота результата в пикселях (по длине трубы)
+    - cut_angle: угол разреза в радианах (0 = разрез вдоль оси X)
+    """
+    x = points[:, 0]
+    y = points[:, 1]
+    z = points[:, 2]
+    
+    # Цилиндрические координаты
+    r = np.sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+    
+    # Сдвигаем углы так, чтобы разрез был в нужном месте
+    theta = (theta - cut_angle + np.pi) % (2 * np.pi)
+    
+    # Вычисляем средний радиус для каждого уровня высоты
+    # (для компенсации неидеальности)
+    z_bins = 100
+    z_min, z_max = z.min(), z.max()
+    bin_edges = np.linspace(z_min, z_max, z_bins + 1)
+    
+    reference_radius = np.zeros(len(points))
+    for i in range(z_bins):
+        mask = (z >= bin_edges[i]) & (z < bin_edges[i + 1])
+        if mask.sum() > 10:
+            reference_radius[mask] = np.median(r[mask])
+    
+    # Отклонение от среднего радиуса (это и есть рельеф)
+    relief = r - reference_radius
+    
+    # Преобразуем в координаты развертки
+    # X = длина дуги = радиус * угол
+    mean_r = np.mean(reference_radius[reference_radius > 0])
+    unwrap_x = theta * mean_r
+    unwrap_y = z
+    
+    # Нормализуем к размеру изображения
+    x_min, x_max = 0, 2 * np.pi * mean_r
+    y_min, y_max = z_min, z_max
+    
+    x_normalized = (unwrap_x - x_min) / (x_max - x_min) * (width - 1)
+    y_normalized = (unwrap_y - y_min) / (y_max - y_min) * (height - 1)
+    
+    # Создаем карту рельефа
+    relief_map = np.full((height, width), np.nan)
+    count_map = np.zeros((height, width))
+    
+    for i in range(len(points)):
+        xi = int(np.round(x_normalized[i]))
+        yi = int(np.round(y_normalized[i]))
+        
+        if 0 <= xi < width and 0 <= yi < height:
+            if np.isnan(relief_map[yi, xi]):
+                relief_map[yi, xi] = relief[i]
+                count_map[yi, xi] = 1
+            else:
+                relief_map[yi, xi] += relief[i]
+                count_map[yi, xi] += 1
+    
+    # Усредняем
+    mask = count_map > 0
+    relief_map[mask] /= count_map[mask]
+    
+    # Интерполируем пропуски
+    valid_mask = ~np.isnan(relief_map)
+    if valid_mask.sum() > 100:
+        valid_points = np.array(np.where(valid_mask)).T
+        valid_values = relief_map[valid_mask]
+        
+        all_points = np.array(np.where(np.ones_like(relief_map, dtype=bool))).T
+        
+        interpolated = griddata(valid_points, valid_values, all_points, 
+                               method='nearest')
+        relief_map = interpolated.reshape(relief_map.shape)
+    
+    return relief_map, (x_min, x_max, y_min, y_max)
+
+def save_unwrap(relief_map, extent, output_path, smoothing=1.0):
+    """Сохраняет развертку как изображение"""
+    # Опциональное сглаживание
+    if smoothing > 0:
+        relief_map = gaussian_filter(relief_map, sigma=smoothing)
+    
+    # Создаем фигуру
+    fig, ax = plt.subplots(figsize=(20, 10))
+    
+    # Отображаем рельеф
+    im = ax.imshow(relief_map, cmap='RdBu_r', aspect='auto', 
+                   origin='lower', extent=extent, interpolation='bilinear')
+    
+    ax.set_xlabel('Развернутая длина окружности (мм)', fontsize=12)
+    ax.set_ylabel('Высота вдоль оси трубы (мм)', fontsize=12)
+    ax.set_title('Развертка трубы', fontsize=14, fontweight='bold')
+    
+    cbar = plt.colorbar(im, ax=ax, label='Отклонение от среднего радиуса (мм)')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Развертка сохранена: {output_path}")
+    plt.close()
+    
+    # Сохраняем данные отдельно
+    data_path = output_path.rsplit('.', 1)[0] + '_data.npz'
+    np.savez_compressed(data_path, relief_map=relief_map, extent=extent)
+    print(f"Данные сохранены: {data_path}")
+
+def main(ply_file, output_image, width=2000, height=1000, smoothing=2.0):
+    """
+    Главная функция
+    
+    Параметры:
+    - ply_file: путь к PLY файлу
+    - output_image: путь для сохранения результата (PNG)
+    - width: ширина развертки в пикселях
+    - height: высота развертки в пикселях
+    - smoothing: сглаживание (0 = без сглаживания)
+    """
+    print("=" * 60)
+    print("РАЗВЕРТКА ТРУБЫ")
+    print("=" * 60)
+    
+    # 1. Загрузка
+    print("\n[1/5] Загрузка облака точек...")
+    points, colors = load_point_cloud(ply_file)
+    
+    # 2. Поиск оси
+    print("\n[2/5] Поиск оси цилиндра...")
+    center, axis = find_cylinder_axis(points)
+    print(f"Центр: {center}")
+    print(f"Направление оси: {axis}")
+    
+    # 3. Выравнивание
+    print("\n[3/5] Выравнивание точек...")
+    aligned_points = align_points(points, center, axis)
+    
+    # 4. Развертка
+    print("\n[4/5] Создание развертки...")
+    relief_map, extent = unwrap_cylinder(aligned_points, width=width, height=height)
+    print(f"Размер развертки: {relief_map.shape}")
+    print(f"Диапазон рельефа: [{np.nanmin(relief_map):.3f}, {np.nanmax(relief_map):.3f}] мм")
+    
+    # 5. Сохранение
+    print("\n[5/5] Сохранение результата...")
+    save_unwrap(relief_map, extent, output_image, smoothing=smoothing)
+    
+    print("\n" + "=" * 60)
+    print("ГОТОВО!")
+    print("=" * 60)
+    
+    return relief_map, extent
+
+# ============================================================================
+# ИСПОЛЬЗОВАНИЕ
+# ============================================================================
+
+if __name__ == "__main__":
+    # Параметры
+    PLY_FILE = "pipe_scan.ply"          # Ваш PLY файл
+    OUTPUT_IMAGE = "pipe_unwrap.png"    # Результат
+    
+    # Настройки развертки
+    WIDTH = 2000      # Ширина в пикселях (по окружности)
+    HEIGHT = 1000     # Высота в пикселях (по длине трубы)
+    SMOOTHING = 2.0   # Сглаживание (0 = без сглаживания, 5 = сильное)
+    
+    # Запуск
+    relief_map, extent = main(
+        ply_file=PLY_FILE,
+        output_image=OUTPUT_IMAGE,
+        width=WIDTH,
+        height=HEIGHT,
+        smoothing=SMOOTHING
+    )
