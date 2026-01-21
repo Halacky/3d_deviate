@@ -1,0 +1,281 @@
+import numpy as np
+import open3d as o3d
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+
+def load_point_cloud(filepath):
+    """Загрузка PLY файла"""
+    pcd = o3d.io.read_point_cloud(filepath)
+    points = np.asarray(pcd.points)
+    
+    colors = None
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+    
+    print(f"Загружено точек: {len(points)}")
+    return points, colors
+
+def find_cylinder_axis(points):
+    """Находит ось цилиндра через PCA"""
+    if len(points) > 20000:
+        indices = np.random.choice(len(points), 20000, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+    
+    pca = PCA(n_components=3)
+    pca.fit(sample)
+    
+    axis = pca.components_[0]
+    center = np.mean(sample, axis=0)
+    
+    return center, axis
+
+def align_points(points, center, axis):
+    """Выравнивает точки так, чтобы ось была вдоль Z"""
+    points_centered = points - center
+    
+    axis = axis / np.linalg.norm(axis)
+    target = np.array([0, 0, 1])
+    
+    v = np.cross(axis, target)
+    s = np.linalg.norm(v)
+    c = np.dot(axis, target)
+    
+    if s > 1e-6:
+        vx = np.array([[0, -v[2], v[1]], 
+                       [v[2], 0, -v[0]], 
+                       [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+    else:
+        R = np.eye(3)
+    
+    aligned = points_centered @ R.T
+    
+    return aligned
+
+def unwrap_points(points, colors=None):
+    """
+    Разворачивает точки цилиндра в 2D координаты
+    Возвращает 2D координаты для каждой точки БЕЗ потерь
+    """
+    x = points[:, 0]
+    y = points[:, 1]
+    z = points[:, 2]
+    
+    # Радиус и угол
+    r = np.sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+    
+    # Нормализуем угол к [0, 2π]
+    theta = (theta + 2 * np.pi) % (2 * np.pi)
+    
+    # Средний радиус (для масштабирования)
+    mean_radius = np.mean(r)
+    
+    # 2D координаты развертки
+    # X = длина дуги по окружности
+    unwrap_x = theta * mean_radius
+    # Y = высота вдоль оси
+    unwrap_y = z
+    # Радиус сохраняем как "цвет" или третью координату
+    unwrap_r = r
+    
+    return unwrap_x, unwrap_y, unwrap_r, theta, mean_radius
+
+def save_unwrap_scatter(unwrap_x, unwrap_y, unwrap_r, colors, output_path, dpi=300):
+    """
+    Сохраняет развертку как scatter plot - каждая точка на своем месте
+    """
+    fig, ax = plt.subplots(figsize=(20, 10))
+    
+    # Если есть цвета - используем их
+    if colors is not None:
+        scatter = ax.scatter(unwrap_x, unwrap_y, c=colors, s=1, alpha=0.8)
+    else:
+        # Иначе цвет = радиус (показывает рельеф)
+        scatter = ax.scatter(unwrap_x, unwrap_y, c=unwrap_r, cmap='viridis', 
+                            s=1, alpha=0.8)
+        plt.colorbar(scatter, ax=ax, label='Радиус (мм)')
+    
+    ax.set_xlabel('Развернутая длина окружности (мм)', fontsize=12)
+    ax.set_ylabel('Высота вдоль оси трубы (мм)', fontsize=12)
+    ax.set_title('Развертка трубы (все точки)', fontsize=14, fontweight='bold')
+    ax.set_aspect('equal', adjustable='box')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    print(f"Scatter plot сохранен: {output_path}")
+    plt.close()
+
+def save_unwrap_density(unwrap_x, unwrap_y, unwrap_r, output_path, bins=2000, dpi=300):
+    """
+    Сохраняет развертку как density plot с высоким разрешением
+    """
+    fig, ax = plt.subplots(figsize=(20, 10))
+    
+    # 2D гистограмма для визуализации плотности
+    h = ax.hist2d(unwrap_x, unwrap_y, bins=bins, cmap='hot', cmin=1)
+    
+    ax.set_xlabel('Развернутая длина окружности (мм)', fontsize=12)
+    ax.set_ylabel('Высота вдоль оси трубы (мм)', fontsize=12)
+    ax.set_title('Развертка трубы (density map)', fontsize=14, fontweight='bold')
+    ax.set_aspect('equal', adjustable='box')
+    
+    plt.colorbar(h[3], ax=ax, label='Плотность точек')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    print(f"Density map сохранен: {output_path}")
+    plt.close()
+
+def save_unwrap_relief(unwrap_x, unwrap_y, unwrap_r, output_path, dpi=300):
+    """
+    Сохраняет развертку с рельефом (радиус как цвет)
+    """
+    fig, ax = plt.subplots(figsize=(20, 10))
+    
+    # Отклонение от среднего радиуса
+    mean_r = np.mean(unwrap_r)
+    relief = unwrap_r - mean_r
+    
+    scatter = ax.scatter(unwrap_x, unwrap_y, c=relief, cmap='RdBu_r', 
+                        s=1, alpha=0.8, vmin=-np.percentile(np.abs(relief), 95),
+                        vmax=np.percentile(np.abs(relief), 95))
+    
+    ax.set_xlabel('Развернутая длина окружности (мм)', fontsize=12)
+    ax.set_ylabel('Высота вдоль оси трубы (мм)', fontsize=12)
+    ax.set_title('Развертка трубы (рельеф поверхности)', fontsize=14, fontweight='bold')
+    ax.set_aspect('equal', adjustable='box')
+    
+    plt.colorbar(scatter, ax=ax, label='Отклонение радиуса (мм)')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    print(f"Relief map сохранен: {output_path}")
+    plt.close()
+
+def save_unwrap_data(unwrap_x, unwrap_y, unwrap_r, theta, output_path):
+    """
+    Сохраняет сырые данные развертки для дальнейшей обработки
+    """
+    np.savez_compressed(
+        output_path,
+        unwrap_x=unwrap_x,
+        unwrap_y=unwrap_y,
+        radius=unwrap_r,
+        theta=theta
+    )
+    print(f"Данные сохранены: {output_path}")
+
+def main(ply_file, output_prefix, dpi=300):
+    """
+    Главная функция - создает несколько вариантов визуализации
+    
+    Параметры:
+    - ply_file: путь к PLY файлу
+    - output_prefix: префикс для выходных файлов
+    - dpi: разрешение изображений
+    """
+    print("=" * 60)
+    print("ТОЧНАЯ РАЗВЕРТКА ТРУБЫ БЕЗ ПОТЕРЬ")
+    print("=" * 60)
+    
+    # 1. Загрузка
+    print("\n[1/5] Загрузка облака точек...")
+    points, colors = load_point_cloud(ply_file)
+    
+    # 2. Поиск оси
+    print("\n[2/5] Поиск оси цилиндра...")
+    center, axis = find_cylinder_axis(points)
+    print(f"Центр: {center}")
+    print(f"Направление оси: {axis}")
+    
+    # 3. Выравнивание
+    print("\n[3/5] Выравнивание точек...")
+    aligned_points = align_points(points, center, axis)
+    
+    # 4. Развертка БЕЗ потерь
+    print("\n[4/5] Развертка точек...")
+    unwrap_x, unwrap_y, unwrap_r, theta, mean_radius = unwrap_points(
+        aligned_points, colors
+    )
+    print(f"Всего точек в развертке: {len(unwrap_x)}")
+    print(f"Средний радиус: {mean_radius:.2f} мм")
+    print(f"Длина окружности: {2 * np.pi * mean_radius:.2f} мм")
+    print(f"Диапазон высоты: [{unwrap_y.min():.2f}, {unwrap_y.max():.2f}] мм")
+    print(f"Диапазон радиуса: [{unwrap_r.min():.2f}, {unwrap_r.max():.2f}] мм")
+    
+    # 5. Сохранение в разных форматах
+    print("\n[5/5] Сохранение результатов...")
+    
+    # Scatter plot (если точек не слишком много)
+    if len(unwrap_x) < 5000000:
+        print("  - Создание scatter plot...")
+        save_unwrap_scatter(
+            unwrap_x, unwrap_y, unwrap_r, colors,
+            f"{output_prefix}_scatter.png", dpi=dpi
+        )
+    else:
+        print("  - Слишком много точек для scatter plot, пропускаем...")
+    
+    # Density map
+    print("  - Создание density map...")
+    save_unwrap_density(
+        unwrap_x, unwrap_y, unwrap_r,
+        f"{output_prefix}_density.png", bins=2000, dpi=dpi
+    )
+    
+    # Relief map
+    print("  - Создание relief map...")
+    save_unwrap_relief(
+        unwrap_x, unwrap_y, unwrap_r,
+        f"{output_prefix}_relief.png", dpi=dpi
+    )
+    
+    # Сохранение данных
+    print("  - Сохранение данных...")
+    save_unwrap_data(
+        unwrap_x, unwrap_y, unwrap_r, theta,
+        f"{output_prefix}_data.npz"
+    )
+    
+    print("\n" + "=" * 60)
+    print("ГОТОВО!")
+    print(f"Созданы файлы:")
+    print(f"  - {output_prefix}_scatter.png (если < 5M точек)")
+    print(f"  - {output_prefix}_density.png")
+    print(f"  - {output_prefix}_relief.png")
+    print(f"  - {output_prefix}_data.npz")
+    print("=" * 60)
+    
+    return unwrap_x, unwrap_y, unwrap_r, theta
+
+# ============================================================================
+# ИСПОЛЬЗОВАНИЕ
+# ============================================================================
+
+if __name__ == "__main__":
+    # Параметры
+    PLY_FILE = "pipe_scan.ply"       # Ваш PLY файл
+    OUTPUT_PREFIX = "pipe_unwrap"     # Префикс для выходных файлов
+    DPI = 300                         # Разрешение (300 для печати, 150 для экрана)
+    
+    # Запуск
+    unwrap_x, unwrap_y, unwrap_r, theta = main(
+        ply_file=PLY_FILE,
+        output_prefix=OUTPUT_PREFIX,
+        dpi=DPI
+    )
+    
+    # Опционально: работа с данными
+    # unwrap_x, unwrap_y - 2D координаты каждой точки
+    # unwrap_r - радиус каждой точки (рельеф)
+    # theta - угол каждой точки в исходной системе
+    
+    print("\nДля загрузки данных используйте:")
+    print(f"data = np.load('{OUTPUT_PREFIX}_data.npz')")
+    print("unwrap_x = data['unwrap_x']")
+    print("unwrap_y = data['unwrap_y']")
+    print("radius = data['radius']")
+    print("theta = data['theta']")
