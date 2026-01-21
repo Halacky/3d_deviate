@@ -1,0 +1,400 @@
+import numpy as np
+import open3d as o3d
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from matplotlib.tri import Triangulation
+from scipy.spatial.distance import cdist
+
+def load_point_cloud(filepath):
+    """Загрузка PLY файла"""
+    pcd = o3d.io.read_point_cloud(filepath)
+    points = np.asarray(pcd.points)
+    
+    colors = None
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+    
+    normals = None
+    if pcd.has_normals():
+        normals = np.asarray(pcd.normals)
+    
+    print(f"Загружено точек: {len(points)}")
+    return pcd, points, colors, normals
+
+def estimate_normals(pcd):
+    """Оценка нормалей для облака точек"""
+    print("Вычисление нормалей...")
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+    )
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+    return pcd
+
+def create_mesh_poisson(pcd, depth=9):
+    """Создание меша методом Пуассона"""
+    print(f"Создание меша методом Пуассона (depth={depth})...")
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, width=0, scale=1.1, linear_fit=False
+    )
+    
+    densities = np.asarray(densities)
+    density_threshold = np.quantile(densities, 0.01)
+    vertices_to_remove = densities < density_threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+    
+    print(f"Меш создан: {len(mesh.vertices)} вершин, {len(mesh.triangles)} треугольников")
+    return mesh
+
+def find_cylinder_axis(points):
+    """Находит ось цилиндра через PCA"""
+    if len(points) > 20000:
+        indices = np.random.choice(len(points), 20000, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+    
+    pca = PCA(n_components=3)
+    pca.fit(sample)
+    
+    axis = pca.components_[0]
+    center = np.mean(sample, axis=0)
+    
+    return center, axis
+
+def align_mesh(mesh, center, axis):
+    """Выравнивает меш так, чтобы ось была вдоль Z"""
+    vertices = np.asarray(mesh.vertices)
+    
+    vertices_centered = vertices - center
+    
+    axis = axis / np.linalg.norm(axis)
+    target = np.array([0, 0, 1])
+    
+    v = np.cross(axis, target)
+    s = np.linalg.norm(v)
+    c = np.dot(axis, target)
+    
+    if s > 1e-6:
+        vx = np.array([[0, -v[2], v[1]], 
+                       [v[2], 0, -v[0]], 
+                       [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+    else:
+        R = np.eye(3)
+    
+    aligned = vertices_centered @ R.T
+    mesh.vertices = o3d.utility.Vector3dVector(aligned)
+    
+    return mesh
+
+def geodesic_unwrap(mesh):
+    """
+    Геодезическая развертка цилиндра
+    Разрезает вдоль одной линии и разворачивает без искажений
+    """
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    
+    x = vertices[:, 0]
+    y = vertices[:, 1]
+    z = vertices[:, 2]
+    
+    # Цилиндрические координаты
+    r = np.sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+    
+    # Находим средний радиус по слоям высоты
+    z_unique = np.linspace(z.min(), z.max(), 100)
+    r_profile = np.zeros(len(vertices))
+    
+    for i, zi in enumerate(z_unique[:-1]):
+        mask = (z >= zi) & (z < z_unique[i+1])
+        if mask.sum() > 0:
+            r_profile[mask] = np.median(r[mask])
+    
+    # Последний слой
+    mask = z >= z_unique[-1]
+    if mask.sum() > 0:
+        r_profile[mask] = np.median(r[mask])
+    
+    # Используем локальный радиус для каждой точки
+    # Это позволяет корректно развернуть неидеальный цилиндр
+    
+    # Выбираем линию разреза (например, theta = 0)
+    cut_angle = 0.0
+    
+    # Нормализуем углы относительно разреза
+    theta_normalized = theta - cut_angle
+    theta_normalized = np.arctan2(np.sin(theta_normalized), np.cos(theta_normalized))
+    
+    # Разворачиваем: длина дуги = радиус * угол
+    # Используем локальный радиус для каждой точки
+    unwrap_x = theta_normalized * r_profile
+    unwrap_y = z
+    
+    # Обработка разреза: находим рёбра, которые пересекают разрез
+    # Эти рёбра нужно "разрезать" - дублировать вершины
+    
+    # Создаем новый список вершин и треугольников
+    new_vertices_3d = []
+    new_vertices_2d = []
+    new_triangles = []
+    
+    vertex_map = {}  # старый индекс -> список новых индексов
+    
+    for tri in triangles:
+        theta_tri = theta_normalized[tri]
+        
+        # Проверяем, пересекает ли треугольник разрез
+        # Разрез происходит там, где угол скачет с -π к +π
+        angle_diff = np.max(theta_tri) - np.min(theta_tri)
+        
+        if angle_diff > np.pi:
+            # Треугольник пересекает разрез
+            new_tri = []
+            
+            for old_idx in tri:
+                # Решаем, на какой стороне разреза находится вершина
+                if theta_normalized[old_idx] < 0:
+                    # Слева от разреза - сдвигаем угол на 2π
+                    if old_idx not in vertex_map:
+                        vertex_map[old_idx] = []
+                    
+                    new_idx = len(new_vertices_3d)
+                    vertex_map[old_idx].append(new_idx)
+                    
+                    new_vertices_3d.append(vertices[old_idx])
+                    # Сдвигаем X на полную окружность
+                    shifted_x = (theta_normalized[old_idx] + 2*np.pi) * r_profile[old_idx]
+                    new_vertices_2d.append([shifted_x, unwrap_y[old_idx]])
+                    
+                    new_tri.append(new_idx)
+                else:
+                    # Справа от разреза - оставляем как есть
+                    if old_idx not in vertex_map:
+                        vertex_map[old_idx] = []
+                        new_idx = len(new_vertices_3d)
+                        vertex_map[old_idx].append(new_idx)
+                        
+                        new_vertices_3d.append(vertices[old_idx])
+                        new_vertices_2d.append([unwrap_x[old_idx], unwrap_y[old_idx]])
+                    else:
+                        # Используем уже созданную вершину
+                        new_idx = vertex_map[old_idx][0]
+                    
+                    new_tri.append(new_idx)
+            
+            new_triangles.append(new_tri)
+        else:
+            # Треугольник не пересекает разрез
+            new_tri = []
+            for old_idx in tri:
+                if old_idx not in vertex_map:
+                    vertex_map[old_idx] = []
+                    new_idx = len(new_vertices_3d)
+                    vertex_map[old_idx].append(new_idx)
+                    
+                    new_vertices_3d.append(vertices[old_idx])
+                    new_vertices_2d.append([unwrap_x[old_idx], unwrap_y[old_idx]])
+                else:
+                    new_idx = vertex_map[old_idx][0]
+                
+                new_tri.append(new_idx)
+            
+            new_triangles.append(new_tri)
+    
+    new_vertices_3d = np.array(new_vertices_3d)
+    new_vertices_2d = np.array(new_vertices_2d)
+    new_triangles = np.array(new_triangles)
+    
+    # Вычисляем рельеф для новых вершин
+    x_new = new_vertices_3d[:, 0]
+    y_new = new_vertices_3d[:, 1]
+    z_new = new_vertices_3d[:, 2]
+    r_new = np.sqrt(x_new**2 + y_new**2)
+    
+    # Локальный средний радиус
+    r_mean_new = np.zeros(len(new_vertices_3d))
+    for i, zi in enumerate(z_unique[:-1]):
+        mask = (z_new >= zi) & (z_new < z_unique[i+1])
+        if mask.sum() > 0:
+            r_mean_new[mask] = np.median(r_new[mask])
+    mask = z_new >= z_unique[-1]
+    if mask.sum() > 0:
+        r_mean_new[mask] = np.median(r_new[mask])
+    
+    relief = r_new - r_mean_new
+    
+    return new_vertices_2d, new_triangles, new_vertices_3d, relief, np.median(r_profile)
+
+def render_flat_unwrap(vertices_2d, triangles, relief, mean_radius, width=4000, height=2000):
+    """
+    Рендерит плоскую развертку
+    """
+    x = vertices_2d[:, 0]
+    y = vertices_2d[:, 1]
+    
+    # Нормализуем координаты
+    x_min, x_max = x.min(), x.max()
+    y_min, y_max = y.min(), y.max()
+    
+    # Реальные размеры
+    circumference = x_max - x_min
+    pipe_height = y_max - y_min
+    
+    print(f"Размеры развертки: {circumference:.1f} x {pipe_height:.1f} мм")
+    
+    # Масштабируем в пиксели с сохранением пропорций
+    aspect_ratio = circumference / pipe_height
+    if aspect_ratio > width / height:
+        # Ограничены по ширине
+        scale = width / circumference
+    else:
+        # Ограничены по высоте
+        scale = height / pipe_height
+    
+    x_scaled = (x - x_min) * scale
+    y_scaled = (y - y_min) * scale
+    
+    # Triangulation
+    triang = Triangulation(x_scaled, y_scaled, triangles)
+    
+    # Рисуем
+    fig, axes = plt.subplots(1, 2, figsize=(24, 12))
+    
+    # 1. Рельеф
+    ax1 = axes[0]
+    
+    # Ограничиваем цветовую шкалу выбросами
+    vmin = np.percentile(relief, 1)
+    vmax = np.percentile(relief, 99)
+    
+    tcf = ax1.tripcolor(triang, relief, cmap='RdBu_r', shading='gouraud', 
+                        vmin=vmin, vmax=vmax)
+    ax1.set_aspect('equal')
+    ax1.set_xlabel(f'Длина ({circumference:.1f} мм)', fontsize=12)
+    ax1.set_ylabel(f'Высота ({pipe_height:.1f} мм)', fontsize=12)
+    ax1.set_title('Плоская развертка: Рельеф', fontsize=14, fontweight='bold')
+    plt.colorbar(tcf, ax=ax1, label='Отклонение радиуса (мм)')
+    
+    # 2. Структура меша
+    ax2 = axes[1]
+    ax2.triplot(triang, 'k-', linewidth=0.1, alpha=0.5)
+    tcf2 = ax2.tripcolor(triang, relief, cmap='viridis', shading='gouraud',
+                         vmin=vmin, vmax=vmax, alpha=0.7)
+    ax2.set_aspect('equal')
+    ax2.set_xlabel(f'Длина ({circumference:.1f} мм)', fontsize=12)
+    ax2.set_ylabel(f'Высота ({pipe_height:.1f} мм)', fontsize=12)
+    ax2.set_title('Плоская развертка: Структура', fontsize=14, fontweight='bold')
+    plt.colorbar(tcf2, ax=ax2, label='Отклонение радиуса (мм)')
+    
+    plt.tight_layout()
+    
+    return fig, (x_scaled, y_scaled, relief)
+
+def save_unwrap_image(fig, output_path, dpi=300):
+    """Сохраняет развертку"""
+    fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='white')
+    print(f"Развертка сохранена: {output_path}")
+    plt.close(fig)
+
+def main(ply_file, output_prefix, poisson_depth=9, width=4000, height=2000, dpi=300):
+    """
+    Главная функция - геодезическая развертка трубы
+    """
+    print("=" * 60)
+    print("ГЕОДЕЗИЧЕСКАЯ РАЗВЕРТКА ТРУБЫ")
+    print("=" * 60)
+    
+    # 1. Загрузка
+    print("\n[1/6] Загрузка облака точек...")
+    pcd, points, colors, normals = load_point_cloud(ply_file)
+    
+    # 2. Нормали
+    if normals is None:
+        print("\n[2/6] Вычисление нормалей...")
+        pcd = estimate_normals(pcd)
+    else:
+        print("\n[2/6] Нормали уже есть")
+    
+    # 3. Создание меша
+    print(f"\n[3/6] Создание меша (depth={poisson_depth})...")
+    mesh = create_mesh_poisson(pcd, depth=poisson_depth)
+    
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    
+    # 4. Поиск оси и выравнивание
+    print("\n[4/6] Выравнивание меша...")
+    center, axis = find_cylinder_axis(points)
+    mesh = align_mesh(mesh, center, axis)
+    
+    # 5. Геодезическая развертка
+    print("\n[5/6] Геодезическая развертка...")
+    vertices_2d, triangles, vertices_3d, relief, mean_radius = geodesic_unwrap(mesh)
+    print(f"Создано вершин: {len(vertices_2d)}")
+    print(f"Треугольников: {len(triangles)}")
+    print(f"Средний радиус: {mean_radius:.2f} мм")
+    print(f"Длина окружности: {2 * np.pi * mean_radius:.2f} мм")
+    
+    # 6. Рендеринг
+    print("\n[6/6] Рендеринг...")
+    fig, render_data = render_flat_unwrap(
+        vertices_2d, triangles, relief, mean_radius, 
+        width=width, height=height
+    )
+    
+    # Сохранение
+    save_unwrap_image(fig, f"{output_prefix}_flat.png", dpi=dpi)
+    
+    # Сохранение меша
+    o3d.io.write_triangle_mesh(f"{output_prefix}_mesh.ply", mesh)
+    print(f"Меш сохранен: {output_prefix}_mesh.ply")
+    
+    # Сохранение данных
+    x_scaled, y_scaled, relief_data = render_data
+    np.savez_compressed(
+        f"{output_prefix}_data.npz",
+        vertices_2d=vertices_2d,
+        vertices_3d=vertices_3d,
+        triangles=triangles,
+        relief=relief,
+        x_pixels=x_scaled,
+        y_pixels=y_scaled,
+        mean_radius=mean_radius
+    )
+    print(f"Данные сохранены: {output_prefix}_data.npz")
+    
+    print("\n" + "=" * 60)
+    print("ГОТОВО!")
+    print(f"Созданы файлы:")
+    print(f"  - {output_prefix}_flat.png - плоская развертка")
+    print(f"  - {output_prefix}_mesh.ply - 3D меш")
+    print(f"  - {output_prefix}_data.npz - данные")
+    print("=" * 60)
+    
+    return vertices_2d, triangles, vertices_3d, relief
+
+# ============================================================================
+# ИСПОЛЬЗОВАНИЕ
+# ============================================================================
+
+if __name__ == "__main__":
+    PLY_FILE = "pipe_scan.ply"
+    OUTPUT_PREFIX = "pipe_unwrap"
+    
+    POISSON_DEPTH = 9    # 8-10 оптимально
+    WIDTH = 4000         # Максимальная ширина в пикселях
+    HEIGHT = 2000        # Максимальная высота в пикселях
+    DPI = 300
+    
+    vertices_2d, triangles, vertices_3d, relief = main(
+        ply_file=PLY_FILE,
+        output_prefix=OUTPUT_PREFIX,
+        poisson_depth=POISSON_DEPTH,
+        width=WIDTH,
+        height=HEIGHT,
+        dpi=DPI
+    )
