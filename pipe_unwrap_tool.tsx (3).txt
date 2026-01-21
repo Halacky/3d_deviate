@@ -1,0 +1,380 @@
+import numpy as np
+import open3d as o3d
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from matplotlib.tri import Triangulation
+import cv2
+
+def load_point_cloud(filepath):
+    """Загрузка PLY файла"""
+    pcd = o3d.io.read_point_cloud(filepath)
+    points = np.asarray(pcd.points)
+    
+    colors = None
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+    
+    normals = None
+    if pcd.has_normals():
+        normals = np.asarray(pcd.normals)
+    
+    print(f"Загружено точек: {len(points)}")
+    return pcd, points, colors, normals
+
+def estimate_normals(pcd):
+    """Оценка нормалей для облака точек"""
+    print("Вычисление нормалей...")
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+    )
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+    return pcd
+
+def create_mesh_poisson(pcd, depth=9):
+    """
+    Создание меша методом Пуассона
+    depth - глубина октодерева (8-10 обычно хорошо)
+    """
+    print(f"Создание меша методом Пуассона (depth={depth})...")
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, width=0, scale=1.1, linear_fit=False
+    )
+    
+    # Удаляем вершины с низкой плотностью (артефакты)
+    densities = np.asarray(densities)
+    density_threshold = np.quantile(densities, 0.01)
+    vertices_to_remove = densities < density_threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+    
+    print(f"Меш создан: {len(mesh.vertices)} вершин, {len(mesh.triangles)} треугольников")
+    return mesh
+
+def create_mesh_bpa(pcd, radius=0.05):
+    """
+    Создание меша методом Ball Pivoting
+    radius - радиус шара (подбирается под размер точек)
+    """
+    print(f"Создание меша методом Ball Pivoting (radius={radius})...")
+    radii = [radius, radius * 2, radius * 4]
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector(radii)
+    )
+    
+    print(f"Меш создан: {len(mesh.vertices)} вершин, {len(mesh.triangles)} треугольников")
+    return mesh
+
+def find_cylinder_axis(points):
+    """Находит ось цилиндра через PCA"""
+    if len(points) > 20000:
+        indices = np.random.choice(len(points), 20000, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+    
+    pca = PCA(n_components=3)
+    pca.fit(sample)
+    
+    axis = pca.components_[0]
+    center = np.mean(sample, axis=0)
+    
+    return center, axis
+
+def align_mesh(mesh, center, axis):
+    """Выравнивает меш так, чтобы ось была вдоль Z"""
+    vertices = np.asarray(mesh.vertices)
+    
+    # Центрируем
+    vertices_centered = vertices - center
+    
+    # Нормализуем ось
+    axis = axis / np.linalg.norm(axis)
+    target = np.array([0, 0, 1])
+    
+    # Вектор вращения
+    v = np.cross(axis, target)
+    s = np.linalg.norm(v)
+    c = np.dot(axis, target)
+    
+    # Матрица поворота
+    if s > 1e-6:
+        vx = np.array([[0, -v[2], v[1]], 
+                       [v[2], 0, -v[0]], 
+                       [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+    else:
+        R = np.eye(3)
+    
+    aligned = vertices_centered @ R.T
+    
+    mesh.vertices = o3d.utility.Vector3dVector(aligned)
+    
+    return mesh
+
+def unwrap_mesh_uv(mesh):
+    """
+    Создает UV-развертку меша цилиндра
+    Возвращает UV-координаты для каждой вершины
+    """
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    
+    x = vertices[:, 0]
+    y = vertices[:, 1]
+    z = vertices[:, 2]
+    
+    # Цилиндрические координаты
+    r = np.sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+    theta = (theta + 2 * np.pi) % (2 * np.pi)
+    
+    # Средний радиус
+    mean_radius = np.median(r)
+    
+    # UV координаты
+    # U = нормализованный угол [0, 1]
+    u = theta / (2 * np.pi)
+    
+    # V = нормализованная высота [0, 1]
+    z_min, z_max = z.min(), z.max()
+    v = (z - z_min) / (z_max - z_min)
+    
+    # Обработка шва (где угол переходит через 0/2π)
+    # Для треугольников пересекающих шов - дублируем вершины
+    fixed_triangles = []
+    fixed_u = list(u)
+    fixed_v = list(v)
+    fixed_vertices = list(vertices)
+    
+    for tri in triangles:
+        u_tri = u[tri]
+        
+        # Проверяем разрыв по U (пересечение шва)
+        if np.max(u_tri) - np.min(u_tri) > 0.5:
+            # Треугольник пересекает шов
+            new_tri = []
+            for i, idx in enumerate(tri):
+                if u[idx] < 0.5:
+                    # Дублируем вершину со сдвинутым U
+                    new_idx = len(fixed_u)
+                    fixed_u.append(u[idx] + 1.0)
+                    fixed_v.append(v[idx])
+                    fixed_vertices.append(vertices[idx])
+                    new_tri.append(new_idx)
+                else:
+                    new_tri.append(idx)
+            fixed_triangles.append(new_tri)
+        else:
+            fixed_triangles.append(tri.tolist())
+    
+    uv = np.column_stack([np.array(fixed_u), np.array(fixed_v)])
+    triangles = np.array(fixed_triangles)
+    vertices = np.array(fixed_vertices)
+    
+    return uv, triangles, vertices, mean_radius, (z_min, z_max)
+
+def render_unwrap(uv, triangles, vertices, mean_radius, z_range, 
+                 width=4000, height=2000, colors=None):
+    """
+    Рендерит развертку в изображение высокого разрешения
+    """
+    z_min, z_max = z_range
+    
+    # Масштабируем UV в пиксели
+    u = uv[:, 0]
+    v = uv[:, 1]
+    
+    # Реальные размеры
+    circumference = 2 * np.pi * mean_radius
+    pipe_height = z_max - z_min
+    
+    # Пиксели
+    x_px = u * width
+    y_px = v * height
+    
+    # Создаем изображение рельефа (радиус)
+    x_3d = vertices[:, 0]
+    y_3d = vertices[:, 1]
+    radius = np.sqrt(x_3d**2 + y_3d**2)
+    relief = radius - mean_radius
+    
+    # Нормализуем рельеф для цвета
+    relief_normalized = (relief - relief.min()) / (relief.max() - relief.min())
+    
+    # Создаем triangulation для matplotlib
+    triang = Triangulation(x_px, y_px, triangles)
+    
+    # Рисуем
+    fig, axes = plt.subplots(1, 2, figsize=(24, 12))
+    
+    # 1. Рельеф
+    ax1 = axes[0]
+    tcf = ax1.tripcolor(triang, relief, cmap='RdBu_r', shading='gouraud')
+    ax1.set_aspect('equal')
+    ax1.set_xlim(0, width)
+    ax1.set_ylim(0, height)
+    ax1.set_xlabel(f'Длина окружности ({circumference:.1f} мм)', fontsize=12)
+    ax1.set_ylabel(f'Высота трубы ({pipe_height:.1f} мм)', fontsize=12)
+    ax1.set_title('Развертка: Рельеф поверхности', fontsize=14, fontweight='bold')
+    plt.colorbar(tcf, ax=ax1, label='Отклонение радиуса (мм)')
+    
+    # 2. Цвета (если есть) или просто структура
+    ax2 = axes[1]
+    if colors is not None:
+        # Используем цвета вершин
+        vertex_colors = colors[:len(vertices)]
+        ax2.tripcolor(triang, facecolors=vertex_colors, shading='flat')
+    else:
+        # Просто структура меша
+        ax2.triplot(triang, 'k-', linewidth=0.1, alpha=0.3)
+        ax2.tripcolor(triang, relief, cmap='viridis', shading='gouraud', alpha=0.7)
+    
+    ax2.set_aspect('equal')
+    ax2.set_xlim(0, width)
+    ax2.set_ylim(0, height)
+    ax2.set_xlabel(f'Длина окружности ({circumference:.1f} мм)', fontsize=12)
+    ax2.set_ylabel(f'Высота трубы ({pipe_height:.1f} мм)', fontsize=12)
+    ax2.set_title('Развертка: Структура меша', fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    return fig, (x_px, y_px, triangles, relief)
+
+def save_unwrap_image(fig, output_path, dpi=300):
+    """Сохраняет развертку"""
+    fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    print(f"Развертка сохранена: {output_path}")
+    plt.close(fig)
+
+def save_mesh(mesh, output_path):
+    """Сохраняет меш"""
+    o3d.io.write_triangle_mesh(output_path, mesh)
+    print(f"Меш сохранен: {output_path}")
+
+def main(ply_file, output_prefix, mesh_method='poisson', poisson_depth=9, 
+         bpa_radius=0.05, width=4000, height=2000, dpi=300):
+    """
+    Главная функция
+    
+    Параметры:
+    - ply_file: путь к PLY файлу
+    - output_prefix: префикс для выходных файлов
+    - mesh_method: 'poisson' или 'bpa' (ball pivoting)
+    - poisson_depth: глубина октодерева для Poisson (8-10)
+    - bpa_radius: радиус шара для BPA
+    - width, height: размер развертки в пикселях
+    - dpi: разрешение изображения
+    """
+    print("=" * 60)
+    print("РАЗВЕРТКА ТРУБЫ ЧЕРЕЗ МЕШ")
+    print("=" * 60)
+    
+    # 1. Загрузка
+    print("\n[1/7] Загрузка облака точек...")
+    pcd, points, colors, normals = load_point_cloud(ply_file)
+    
+    # 2. Вычисление нормалей (если нет)
+    if normals is None:
+        print("\n[2/7] Вычисление нормалей...")
+        pcd = estimate_normals(pcd)
+    else:
+        print("\n[2/7] Нормали уже есть")
+    
+    # 3. Создание меша
+    print(f"\n[3/7] Создание меша ({mesh_method})...")
+    if mesh_method == 'poisson':
+        mesh = create_mesh_poisson(pcd, depth=poisson_depth)
+    elif mesh_method == 'bpa':
+        mesh = create_mesh_bpa(pcd, radius=bpa_radius)
+    else:
+        raise ValueError("mesh_method должен быть 'poisson' или 'bpa'")
+    
+    # Очистка меша
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    
+    # 4. Поиск оси
+    print("\n[4/7] Поиск оси цилиндра...")
+    center, axis = find_cylinder_axis(points)
+    print(f"Центр: {center}")
+    print(f"Ось: {axis}")
+    
+    # 5. Выравнивание меша
+    print("\n[5/7] Выравнивание меша...")
+    mesh = align_mesh(mesh, center, axis)
+    
+    # 6. UV-развертка
+    print("\n[6/7] Создание UV-развертки...")
+    uv, triangles, vertices, mean_radius, z_range = unwrap_mesh_uv(mesh)
+    print(f"UV-координаты созданы для {len(uv)} вершин")
+    print(f"Средний радиус: {mean_radius:.2f} мм")
+    print(f"Длина окружности: {2 * np.pi * mean_radius:.2f} мм")
+    print(f"Высота трубы: {z_range[1] - z_range[0]:.2f} мм")
+    
+    # 7. Рендеринг и сохранение
+    print("\n[7/7] Рендеринг развертки...")
+    fig, unwrap_data = render_unwrap(
+        uv, triangles, vertices, mean_radius, z_range,
+        width=width, height=height, colors=colors
+    )
+    
+    # Сохранение
+    save_unwrap_image(fig, f"{output_prefix}_unwrap.png", dpi=dpi)
+    save_mesh(mesh, f"{output_prefix}_mesh.ply")
+    
+    # Сохранение данных
+    x_px, y_px, tri, relief = unwrap_data
+    np.savez_compressed(
+        f"{output_prefix}_data.npz",
+        uv=uv,
+        triangles=triangles,
+        vertices=vertices,
+        relief=relief,
+        x_pixels=x_px,
+        y_pixels=y_px,
+        mean_radius=mean_radius,
+        z_range=z_range
+    )
+    print(f"Данные сохранены: {output_prefix}_data.npz")
+    
+    print("\n" + "=" * 60)
+    print("ГОТОВО!")
+    print(f"Созданы файлы:")
+    print(f"  - {output_prefix}_unwrap.png - развертка")
+    print(f"  - {output_prefix}_mesh.ply - меш")
+    print(f"  - {output_prefix}_data.npz - данные")
+    print("=" * 60)
+    
+    return mesh, uv, triangles, vertices
+
+# ============================================================================
+# ИСПОЛЬЗОВАНИЕ
+# ============================================================================
+
+if __name__ == "__main__":
+    # Параметры
+    PLY_FILE = "pipe_scan.ply"
+    OUTPUT_PREFIX = "pipe_unwrap"
+    
+    # Настройки меша
+    MESH_METHOD = 'poisson'  # 'poisson' или 'bpa'
+    POISSON_DEPTH = 9        # 8-10 обычно хорошо (больше = детальнее, но медленнее)
+    BPA_RADIUS = 0.05        # для метода ball pivoting (подбирается)
+    
+    # Настройки развертки
+    WIDTH = 4000             # Ширина в пикселях
+    HEIGHT = 2000            # Высота в пикселях
+    DPI = 300                # Разрешение
+    
+    # Запуск
+    mesh, uv, triangles, vertices = main(
+        ply_file=PLY_FILE,
+        output_prefix=OUTPUT_PREFIX,
+        mesh_method=MESH_METHOD,
+        poisson_depth=POISSON_DEPTH,
+        bpa_radius=BPA_RADIUS,
+        width=WIDTH,
+        height=HEIGHT,
+        dpi=DPI
+    )
