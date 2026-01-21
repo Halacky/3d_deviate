@@ -1,0 +1,444 @@
+import React, { useState } from 'react';
+import { Upload, Download, Settings, Info } from 'lucide-react';
+
+const PipeUnwrapTool = () => {
+  const [params, setParams] = useState({
+    smoothing: 5,
+    angleResolution: 360,
+    heightResolution: 500,
+    radiusMethod: 'median'
+  });
+
+  const [code] = useState(`import numpy as np
+import open3d as o3d
+from scipy.spatial.distance import cdist
+from scipy.ndimage import gaussian_filter
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+def load_point_cloud(filepath):
+    """Загрузка PLY файла"""
+    pcd = o3d.io.read_point_cloud(filepath)
+    points = np.asarray(pcd.points)
+    
+    # Проверка наличия цветов
+    colors = None
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors)
+    
+    return points, colors
+
+def find_cylinder_axis(points, sample_size=10000):
+    """
+    Находит ось цилиндра используя PCA
+    Работает даже для неидеальных цилиндров
+    """
+    # Для больших облаков - используем выборку
+    if len(points) > sample_size:
+        indices = np.random.choice(len(points), sample_size, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+    
+    # PCA для нахождения главного направления
+    pca = PCA(n_components=3)
+    pca.fit(sample)
+    
+    # Главная компонента - ось цилиндра
+    axis_direction = pca.components_[0]
+    
+    # Центр масс как точка на оси
+    axis_point = np.mean(sample, axis=0)
+    
+    return axis_point, axis_direction
+
+def align_to_z_axis(points, axis_point, axis_direction):
+    """
+    Выравнивает облако точек так, чтобы ось цилиндра совпадала с осью Z
+    """
+    # Нормализуем направление оси
+    axis_direction = axis_direction / np.linalg.norm(axis_direction)
+    
+    # Вектор оси Z
+    z_axis = np.array([0, 0, 1])
+    
+    # Вектор вращения (cross product)
+    v = np.cross(axis_direction, z_axis)
+    s = np.linalg.norm(v)
+    c = np.dot(axis_direction, z_axis)
+    
+    # Матрица поворота (формула Родрига)
+    if s > 1e-6:  # Если оси не параллельны
+        vx = np.array([[0, -v[2], v[1]], 
+                       [v[2], 0, -v[0]], 
+                       [-v[1], v[0], 0]])
+        rotation_matrix = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+    else:
+        rotation_matrix = np.eye(3)
+    
+    # Центрируем и поворачиваем
+    centered = points - axis_point
+    aligned = centered @ rotation_matrix.T
+    
+    return aligned, rotation_matrix
+
+def compute_cylindrical_coords(points, adaptive_radius=True):
+    """
+    Преобразует точки в цилиндрические координаты
+    
+    Parameters:
+    - points: aligned точки (ось Z - ось цилиндра)
+    - adaptive_radius: адаптивное вычисление радиуса по секциям
+    """
+    x = points[:, 0]
+    y = points[:, 1]
+    z = points[:, 2]
+    
+    # Радиус от оси Z
+    r = np.sqrt(x**2 + y**2)
+    
+    # Угол (0 до 2π)
+    theta = np.arctan2(y, x)
+    theta = (theta + 2 * np.pi) % (2 * np.pi)  # Нормализация к [0, 2π]
+    
+    # Высота
+    height = z
+    
+    if adaptive_radius:
+        # Вычисляем средний радиус для каждого уровня высоты
+        # для компенсации неидеальности цилиндра
+        height_bins = 50
+        h_min, h_max = height.min(), height.max()
+        bin_edges = np.linspace(h_min, h_max, height_bins + 1)
+        
+        reference_radii = np.zeros(len(points))
+        
+        for i in range(height_bins):
+            mask = (height >= bin_edges[i]) & (height < bin_edges[i + 1])
+            if mask.sum() > 0:
+                median_r = np.median(r[mask])
+                reference_radii[mask] = median_r
+        
+        # Отклонение от среднего радиуса
+        radius_deviation = r - reference_radii
+    else:
+        # Глобальный средний радиус
+        median_r = np.median(r)
+        radius_deviation = r - median_r
+    
+    return theta, height, radius_deviation, r
+
+def create_unwrap_map(theta, height, radius_deviation, 
+                      angle_resolution=360, height_resolution=500,
+                      smoothing=1.0):
+    """
+    Создает 2D развертку с сохранением рельефа
+    
+    Returns:
+    - unwrap_map: 2D массив с отклонениями радиуса
+    - extent: границы для отображения
+    """
+    # Нормализация углов к [0, angle_resolution]
+    theta_normalized = theta / (2 * np.pi) * angle_resolution
+    
+    # Нормализация высоты к [0, height_resolution]
+    h_min, h_max = height.min(), height.max()
+    height_normalized = (height - h_min) / (h_max - h_min) * height_resolution
+    
+    # Создание 2D карты
+    unwrap_map = np.full((height_resolution, angle_resolution), np.nan)
+    count_map = np.zeros((height_resolution, angle_resolution))
+    
+    # Заполнение карты
+    for i in range(len(theta)):
+        angle_idx = int(theta_normalized[i]) % angle_resolution
+        height_idx = int(height_normalized[i])
+        
+        if 0 <= height_idx < height_resolution:
+            if np.isnan(unwrap_map[height_idx, angle_idx]):
+                unwrap_map[height_idx, angle_idx] = radius_deviation[i]
+                count_map[height_idx, angle_idx] = 1
+            else:
+                # Усреднение если несколько точек попали в один пиксель
+                unwrap_map[height_idx, angle_idx] += radius_deviation[i]
+                count_map[height_idx, angle_idx] += 1
+    
+    # Усреднение
+    mask = count_map > 0
+    unwrap_map[mask] /= count_map[mask]
+    
+    # Интерполяция пропущенных значений
+    unwrap_map = interpolate_missing(unwrap_map)
+    
+    # Сглаживание
+    if smoothing > 0:
+        unwrap_map = gaussian_filter(unwrap_map, sigma=smoothing)
+    
+    # Границы для корректного отображения
+    extent = [0, 2 * np.pi * np.median(radius_deviation + np.median(height)), 
+              h_min, h_max]
+    
+    return unwrap_map, extent
+
+def interpolate_missing(data):
+    """Интерполяция пропущенных значений"""
+    from scipy.interpolate import griddata
+    
+    # Найти валидные точки
+    valid_mask = ~np.isnan(data)
+    
+    if valid_mask.sum() == 0:
+        return data
+    
+    # Координаты валидных точек
+    coords = np.array(np.where(valid_mask)).T
+    values = data[valid_mask]
+    
+    # Координаты всех точек
+    all_coords = np.array(np.where(np.ones_like(data, dtype=bool))).T
+    
+    # Интерполяция
+    interpolated = griddata(coords, values, all_coords, method='nearest')
+    
+    # Восстанавливаем форму
+    result = interpolated.reshape(data.shape)
+    
+    return result
+
+def unwrap_pipe(filepath, angle_resolution=360, height_resolution=500, 
+                smoothing=1.0, adaptive_radius=True, save_path=None):
+    """
+    Главная функция для создания развертки трубы
+    
+    Parameters:
+    - filepath: путь к PLY файлу
+    - angle_resolution: разрешение по углу (пикселей на 360°)
+    - height_resolution: разрешение по высоте
+    - smoothing: степень сглаживания (0 - без сглаживания)
+    - adaptive_radius: адаптивное вычисление радиуса
+    - save_path: путь для сохранения результата
+    """
+    print("Загрузка облака точек...")
+    points, colors = load_point_cloud(filepath)
+    print(f"Загружено {len(points)} точек")
+    
+    print("Поиск оси цилиндра...")
+    axis_point, axis_direction = find_cylinder_axis(points)
+    
+    print("Выравнивание облака точек...")
+    aligned_points, rotation = align_to_z_axis(points, axis_point, axis_direction)
+    
+    print("Преобразование в цилиндрические координаты...")
+    theta, height, radius_dev, r = compute_cylindrical_coords(
+        aligned_points, adaptive_radius=adaptive_radius
+    )
+    
+    print("Создание развертки...")
+    unwrap_map, extent = create_unwrap_map(
+        theta, height, radius_dev,
+        angle_resolution=angle_resolution,
+        height_resolution=height_resolution,
+        smoothing=smoothing
+    )
+    
+    # Визуализация
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # 3D визуализация исходных точек
+    ax1 = fig.add_subplot(121, projection='3d')
+    scatter = ax1.scatter(points[:, 0], points[:, 1], points[:, 2], 
+                         c=radius_dev, cmap='RdBu_r', s=0.5, alpha=0.6)
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax1.set_zlabel('Z')
+    ax1.set_title('Исходное облако точек')
+    plt.colorbar(scatter, ax=ax1, label='Отклонение радиуса (мм)')
+    
+    # 2D развертка
+    ax2 = axes[1]
+    im = ax2.imshow(unwrap_map, cmap='RdBu_r', aspect='auto', 
+                    origin='lower', extent=extent, interpolation='bilinear')
+    ax2.set_xlabel('Длина окружности (мм)')
+    ax2.set_ylabel('Высота (мм)')
+    ax2.set_title('2D развертка трубы')
+    plt.colorbar(im, ax=ax2, label='Отклонение радиуса (мм)')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Развертка сохранена: {save_path}")
+        
+        # Сохранение данных развертки в numpy формате
+        data_path = save_path.rsplit('.', 1)[0] + '_data.npz'
+        np.savez(data_path, unwrap_map=unwrap_map, extent=extent)
+        print(f"Данные сохранены: {data_path}")
+    
+    plt.show()
+    
+    return unwrap_map, extent, (theta, height, radius_dev)
+
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ:
+if __name__ == "__main__":
+    # Замените на путь к вашему файлу
+    filepath = "pipe_scan.ply"
+    
+    # Создание развертки
+    unwrap_map, extent, coords = unwrap_pipe(
+        filepath=filepath,
+        angle_resolution=720,      # Высокое разрешение по углу
+        height_resolution=1000,     # Высокое разрешение по высоте
+        smoothing=2.0,              # Умеренное сглаживание
+        adaptive_radius=True,       # Адаптивный радиус для неидеальных труб
+        save_path="pipe_unwrap.png"
+    )`);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 p-8">
+      <div className="max-w-6xl mx-auto">
+        <div className="bg-white rounded-xl shadow-lg p-8">
+          <div className="flex items-center gap-3 mb-6">
+            <div className="p-3 bg-blue-500 rounded-lg">
+              <Upload className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-slate-800">
+                Развертка облака точек трубы
+              </h1>
+              <p className="text-slate-600">
+                Python скрипт для создания 2D развертки из PLY файла
+              </p>
+            </div>
+          </div>
+
+          <div className="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6">
+            <div className="flex items-start gap-3">
+              <Info className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
+              <div className="text-sm text-blue-900">
+                <p className="font-semibold mb-2">Возможности скрипта:</p>
+                <ul className="space-y-1 ml-4">
+                  <li>✓ Работает с неидеальными цилиндрами</li>
+                  <li>✓ Автоматическое нахождение оси через PCA</li>
+                  <li>✓ Адаптивное вычисление радиуса по секциям</li>
+                  <li>✓ Интерполяция пропущенных данных</li>
+                  <li>✓ Настраиваемое разрешение и сглаживание</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Settings className="w-5 h-5 text-slate-600" />
+              <h2 className="text-lg font-semibold text-slate-800">
+                Параметры (настраиваются в коде)
+              </h2>
+            </div>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="p-4 bg-slate-50 rounded-lg">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Разрешение по углу
+                </label>
+                <input
+                  type="range"
+                  min="180"
+                  max="1440"
+                  value={params.angleResolution}
+                  onChange={(e) => setParams({...params, angleResolution: parseInt(e.target.value)})}
+                  className="w-full"
+                />
+                <p className="text-xs text-slate-600 mt-1">{params.angleResolution} пикселей</p>
+              </div>
+
+              <div className="p-4 bg-slate-50 rounded-lg">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Разрешение по высоте
+                </label>
+                <input
+                  type="range"
+                  min="200"
+                  max="2000"
+                  step="100"
+                  value={params.heightResolution}
+                  onChange={(e) => setParams({...params, heightResolution: parseInt(e.target.value)})}
+                  className="w-full"
+                />
+                <p className="text-xs text-slate-600 mt-1">{params.heightResolution} пикселей</p>
+              </div>
+
+              <div className="p-4 bg-slate-50 rounded-lg">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Сглаживание
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="0.5"
+                  value={params.smoothing}
+                  onChange={(e) => setParams({...params, smoothing: parseFloat(e.target.value)})}
+                  className="w-full"
+                />
+                <p className="text-xs text-slate-600 mt-1">σ = {params.smoothing}</p>
+              </div>
+
+              <div className="p-4 bg-slate-50 rounded-lg">
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Метод вычисления радиуса
+                </label>
+                <select
+                  value={params.radiusMethod}
+                  onChange={(e) => setParams({...params, radiusMethod: e.target.value})}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm"
+                >
+                  <option value="median">Адаптивный (по секциям)</option>
+                  <option value="global">Глобальный медианный</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-lg font-semibold text-slate-800">Python код</h2>
+              <button
+                onClick={() => navigator.clipboard.writeText(code)}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 transition-colors text-sm"
+              >
+                <Download className="w-4 h-4" />
+                Копировать код
+              </button>
+            </div>
+            
+            <div className="bg-slate-900 rounded-lg p-4 overflow-x-auto">
+              <pre className="text-sm text-slate-100 font-mono">
+                <code>{code}</code>
+              </pre>
+            </div>
+          </div>
+
+          <div className="bg-amber-50 border-l-4 border-amber-500 p-4 mb-6">
+            <h3 className="font-semibold text-amber-900 mb-2">Требования:</h3>
+            <pre className="text-sm text-amber-800 font-mono bg-white p-3 rounded">
+pip install numpy open3d scipy matplotlib scikit-learn
+            </pre>
+          </div>
+
+          <div className="bg-slate-50 rounded-lg p-4">
+            <h3 className="font-semibold text-slate-800 mb-3">Как использовать:</h3>
+            <ol className="space-y-2 text-sm text-slate-700">
+              <li>1. Установите необходимые библиотеки</li>
+              <li>2. Сохраните код в файл (например, <code className="bg-white px-2 py-1 rounded">unwrap_pipe.py</code>)</li>
+              <li>3. Замените <code className="bg-white px-2 py-1 rounded">filepath</code> на путь к вашему PLY файлу</li>
+              <li>4. Настройте параметры по необходимости</li>
+              <li>5. Запустите: <code className="bg-white px-2 py-1 rounded">python unwrap_pipe.py</code></li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default PipeUnwrapTool;
